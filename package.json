@@ -1,0 +1,16 @@
+{
+  "name": "otc-funnel-api",
+  "version": "1.0.0",
+  "description": "Self-hosted, read-only scoped proxy that exposes ONLY your OnlyChat (OTC) Telegram funnel to a partner — without sharing your OnlyChat login, token, or fans' conversations.",
+  "type": "module",
+  "license": "MIT",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  }
+}

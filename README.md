@@ -1,0 +1,104 @@
+# OTC Funnel API
+
+A tiny, self-hosted, **read-only** proxy that exposes **only your OnlyChat (OTC) Telegram
+funnel** to a partner — **without** giving them your OnlyChat login, your bearer token, or your
+fans' conversations.
+
+You run it. Your OnlyChat credentials stay in `.env` on your machine. The partner gets one
+**`PARTNER_API_KEY`** that can only read `/funnel/*`. Revoke the key → access gone, your OTC
+account untouched.
+
+```
+ OnlyChat  ◀──your creds──▶  OTC Funnel API (this)  ◀──partner API key──▶  Partner
+                              read-only · scoped · no msg bodies/notes/PII
+```
+
+## Install
+
+Requires Node ≥ 18.
+
+```bash
+git clone <this-repo> && cd otc-funnel-api
+npm install
+cp .env.example .env      # then fill it in (see below)
+npm start                 # http://localhost:8787
+```
+
+### Configure `.env`
+
+| Var | What |
+|---|---|
+| `PARTNER_API_KEYS` | Key(s) you give partners. `openssl rand -hex 32`. Comma-separate for several. |
+| `ONLYCHAT_ORG_ID` | Your org CUID — from `GET /organization/me` or the SPA URL. |
+| `ONLYCHAT_CREATOR_ID` | Your creator CUID — from the SPA URL. |
+| **Mode A** `ONLYCHAT_TOKEN` | Bearer token sniffed from DevTools on `app.only-chat.ai`. Simplest. ⚠️ Can rotate — re-sniff if you start getting 401s. |
+| **Mode B** `ONLYCHAT_EMAIL` + `ONLYCHAT_PASSWORD` | Recommended. Leave `ONLYCHAT_TOKEN` empty; the service logs in, caches the ~30-min JWT, and auto-refreshes. Survives token rotation. |
+
+## Endpoints (what the partner can call)
+
+All require `Authorization: Bearer <PARTNER_API_KEY>`.
+
+### `GET /funnel/summary?days=30`
+```json
+{
+  "window_days": 30,
+  "totals": { "fans": 812, "arrived_in_window": 134, "active_in_window": 410, "replied": 356, "ai_enabled": 790 },
+  "arrivals_by_day": [ { "date": "2026-06-01", "count": 7 } ],
+  "arrival_coverage": "812/812",
+  "generated_at": "2026-06-16T16:00:00Z"
+}
+```
+
+### `GET /funnel/fans?days=30&page=0&size=50`
+```json
+{
+  "data": [
+    {
+      "fan_id": "cmolsfo9p…", "telegram_fan_id": "6610147988",
+      "name": "dripwave 💧", "username": "Dripwave88",
+      "arrived_at": "2026-04-30T17:55:00Z", "last_interaction_at": "2026-04-30T17:59:50Z",
+      "ai_enabled": true, "tags": ["vip"],
+      "messages_sent": 0, "messages_total": 3,
+      "script_progress": { "sent": 0, "total": 3 }
+    }
+  ],
+  "total_count": 812, "page": 0, "size": 50
+}
+```
+
+### `GET /health` → `{ "ok": true }` (no auth)
+
+**Never exposed:** message text, fan notes/personalInfo, phone numbers, your OnlyChat token,
+org/billing endpoints, and any write/mutation. Widening scope is a deliberate code change.
+
+## How it works (and its limits)
+
+- OnlyChat has **no arrival timestamp** and **no webhook**. Arrival is derived as the earliest
+  message `createdAt` per fan (the fan row is created on first message), cached permanently in
+  `.arrivals.json`. New fans/activity are picked up by polling — call `/summary` on a schedule.
+- `/summary` warms the arrival cache up to `MAX_BACKFILL_PER_CALL` fans per call, so
+  `arrived_in_window` / `replied` / `arrivals_by_day` reach full accuracy after the first few
+  calls (`arrival_coverage` tells you where it's at), then stay exact.
+- Upstream reads are memory-cached for `UPSTREAM_CACHE_TTL_MS` (60s default) so a partner
+  hammering you can't hammer OnlyChat.
+- **No purchases** on the Telegram side — OnlyChat doesn't expose monetization for TG fans.
+
+## Expose it to the partner
+
+- **Cloudflare Tunnel** (zero open ports): `cloudflared tunnel --url http://localhost:8787`
+- or a small VPS behind HTTPS (Caddy/nginx).
+
+Give the partner the **URL** + their **`PARTNER_API_KEY`**. Done.
+
+## Security
+
+- `.env` and `.arrivals.json` are git-ignored — never commit them, never send them.
+- Prefer Mode B so a rotated OnlyChat token self-heals.
+- Read-only by design; one key per partner; rotate by editing `.env` and restarting.
+- HTTPS whenever it's reachable from the internet.
+
+---
+
+> The OnlyChat API is **undocumented / reverse-engineered**. Endpoints can change without
+> notice; if something starts failing, re-capture from the browser before assuming a bug.
+> MIT licensed — use at your own risk.
