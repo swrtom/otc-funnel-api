@@ -66,10 +66,24 @@ All require `Authorization: Bearer <PARTNER_API_KEY>`.
 }
 ```
 
+### `GET /funnel/fans/:fanId/messages?page=0&size=20` — **opt-in**
+Conversation transcript for one fan, newest-first. **Disabled by default** (403) — the OnlyChat
+owner enables it by setting `EXPOSE_MESSAGES=true` in `.env`, since DMs are the most sensitive data.
+```json
+{
+  "fan": { "id": "…", "name": "…", "telegramFanId": "…" },
+  "total_count": 3, "page": 0, "size": 20,
+  "data": [
+    { "id": "…", "text": "lily. u? 😊", "role": "creator", "ai_generated": true, "media_count": 0, "created_at": "2026-04-30T17:59:50Z" }
+  ]
+}
+```
+
 ### `GET /health` → `{ "ok": true }` (no auth)
 
-**Never exposed:** message text, fan notes/personalInfo, phone numbers, your OnlyChat token,
-org/billing endpoints, and any write/mutation. Widening scope is a deliberate code change.
+**Off by default** (owner opts in): conversation transcripts (`EXPOSE_MESSAGES=true`).
+**Never exposed:** fan notes/personalInfo, phone numbers, your OnlyChat token, org/billing
+endpoints, and any write/mutation. Widening further is a deliberate code change.
 
 ## How it works (and its limits)
 

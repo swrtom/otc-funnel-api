@@ -20,6 +20,7 @@ const {
   ONLYCHAT_PASSWORD,
   UPSTREAM_CACHE_TTL_MS = 60000,
   MAX_BACKFILL_PER_CALL = 40,
+  EXPOSE_MESSAGES = "false", // opt-in: when "true", /funnel/fans/:id/messages returns message text
 } = process.env;
 
 const TG = "https://telegram-api.only-chat.ai";
@@ -225,6 +226,40 @@ app.get("/funnel/fans", auth, async (req, res) => {
       });
     }
     res.json({ data, total_count: totalCount, page, size });
+  } catch (e) {
+    res.status(502).json({ error: "upstream", detail: String(e.message || e) });
+  }
+});
+
+// Conversation transcripts for ONE fan. Off by default — the owner opts in with
+// EXPOSE_MESSAGES=true, since this is the most sensitive data (fans' private DMs).
+app.get("/funnel/fans/:fanId/messages", auth, async (req, res) => {
+  if (String(EXPOSE_MESSAGES).toLowerCase() !== "true") {
+    return res.status(403).json({
+      error: "messages_disabled",
+      detail: "Conversation access is off. The OnlyChat owner must set EXPOSE_MESSAGES=true.",
+    });
+  }
+  try {
+    const page = Math.max(0, parseInt(req.query.page) || 0);
+    const size = Math.max(1, Math.min(100, parseInt(req.query.size) || 20));
+    const j = await tg(`/creator/${cid}/follows/fan/${req.params.fanId}/messages?pageIndex=${page}&pageSize=${size}`);
+    const pm = j.paginatedMessages || {};
+    res.json({
+      fan: j.fan ?? null,
+      total_count: pm.totalCount ?? 0,
+      page,
+      size,
+      // newest-first, mirroring upstream
+      data: (pm.data || []).map((m) => ({
+        id: m.id,
+        text: m.text ?? null,
+        role: m.role, // "creator" | "fan"
+        ai_generated: !!m.aiGenerated,
+        media_count: m.mediaCount ?? 0,
+        created_at: m.createdAt,
+      })),
+    });
   } catch (e) {
     res.status(502).json({ error: "upstream", detail: String(e.message || e) });
   }
