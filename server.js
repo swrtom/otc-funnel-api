@@ -3,6 +3,10 @@
 // in .env on your machine; the partner only ever gets a PARTNER_API_KEY that
 // hits /funnel/*. No message bodies, notes, phones, or mutations are exposed.
 //
+// One instance can serve MANY creators of the SAME OnlyChat account (same org):
+// configure ONLYCHAT_CREATOR_IDS and pick one per call with ?creator=<id>.
+// Omitting it falls back to the first configured creator (backward compatible).
+//
 //   npm install && cp .env.example .env  (fill it) && npm start
 //
 // See README.md for the full contract and security model.
@@ -14,7 +18,9 @@ const {
   PORT = 8787,
   PARTNER_API_KEYS = "",
   ONLYCHAT_ORG_ID,
-  ONLYCHAT_CREATOR_ID,
+  ONLYCHAT_CREATOR_IDS,        // comma-separated list of creator CUIDs (preferred)
+  ONLYCHAT_CREATOR_ID,         // legacy single-creator alias (still honored)
+  ONLYCHAT_CREATORS,           // optional friendly labels: "emy:cuid1,lina:cuid2"
   ONLYCHAT_TOKEN,
   ONLYCHAT_EMAIL,
   ONLYCHAT_PASSWORD,
@@ -26,15 +32,55 @@ const {
 const TG = "https://telegram-api.only-chat.ai";
 const API = "https://api.app.only-chat.ai";
 const SECRET = "Banane-Bleue-88"; // required header on the auth host (api.app.*)
-const cid = ONLYCHAT_CREATOR_ID;
 const keys = new Set(PARTNER_API_KEYS.split(",").map((s) => s.trim()).filter(Boolean));
 
-if (!ONLYCHAT_ORG_ID || !cid) throw new Error("Set ONLYCHAT_ORG_ID and ONLYCHAT_CREATOR_ID in .env");
+// ── creator allowlist ───────────────────────────────────────────────────────────
+// Resolve the set of creators this instance is allowed to serve. ONLYCHAT_CREATORS
+// ("label:id,...") supplies labels; ONLYCHAT_CREATOR_IDS / the legacy single
+// ONLYCHAT_CREATOR_ID supply the rest. First entry is the default for ?creator=.
+function parseCreators() {
+  const out = [];
+  const seen = new Set();
+  const add = (id, label) => {
+    id = (id || "").trim();
+    if (!id || seen.has(id)) return;
+    seen.add(id);
+    out.push({ id, label: (label || id).trim() });
+  };
+  for (const pair of (ONLYCHAT_CREATORS || "").split(",")) {
+    if (!pair.trim()) continue;
+    const [a, b] = pair.split(":").map((s) => (s || "").trim());
+    if (b) add(b, a); else add(a); // "label:id" or bare "id"
+  }
+  for (const id of (ONLYCHAT_CREATOR_IDS || "").split(",")) add(id);
+  add(ONLYCHAT_CREATOR_ID); // legacy alias
+  return out;
+}
+const creators = parseCreators();
+const creatorIds = new Set(creators.map((c) => c.id));
+const defaultCreator = creators[0]?.id;
+
+if (!ONLYCHAT_ORG_ID || !defaultCreator)
+  throw new Error("Set ONLYCHAT_ORG_ID and ONLYCHAT_CREATOR_IDS (or legacy ONLYCHAT_CREATOR_ID) in .env");
 if (!keys.size) throw new Error("Set PARTNER_API_KEYS in .env (openssl rand -hex 32)");
 if (!ONLYCHAT_TOKEN && !(ONLYCHAT_EMAIL && ONLYCHAT_PASSWORD))
   throw new Error("Set ONLYCHAT_TOKEN (Mode A) or ONLYCHAT_EMAIL+ONLYCHAT_PASSWORD (Mode B)");
 
+// Resolve & validate ?creator= against the allowlist; default to the first
+// configured creator. Returns null (and writes a 400) on an unknown creator so a
+// partner can never pump arbitrary creator IDs of the org through the proxy.
+function pickCreator(req, res) {
+  const q = (req.query.creator || "").trim();
+  if (!q) return defaultCreator;
+  if (!creatorIds.has(q)) {
+    res.status(400).json({ error: "unknown_creator", detail: "creator not in configured allowlist" });
+    return null;
+  }
+  return q;
+}
+
 // ── arrival cache (immutable per fan) — persisted so restarts keep the warm-up ──
+// Keyed by `${creatorId}:${fanId}` so creators never share/clobber arrivals.
 const CACHE_FILE = new URL("./.arrivals.json", import.meta.url);
 let arrivals = {};
 try {
@@ -47,6 +93,7 @@ const saveArrivals = () => {
     try { writeFileSync(CACHE_FILE, JSON.stringify(arrivals)); } catch { /* best-effort */ }
   }, 500);
 };
+const akey = (cid, fanId) => `${cid}:${fanId}`;
 
 // ── upstream auth: Mode A static token, or Mode B login + JWT cache/refresh ─────
 let jwt = { token: ONLYCHAT_TOKEN || null, exp: 0 };
@@ -85,8 +132,8 @@ async function cached(key, fn) {
 }
 
 // ── upstream reads ──────────────────────────────────────────────────────────────
-async function fetchAllFans() {
-  return cached("fans", async () => {
+async function fetchAllFans(cid) {
+  return cached(`fans:${cid}`, async () => {
     const all = [];
     let page = 0, total = Infinity;
     while (all.length < total) {
@@ -104,7 +151,7 @@ async function fetchAllFans() {
 // Walk a fan's messages newest-first to derive: total count, fan-sent count, and
 // the EARLIEST createdAt (≈ arrival — the fan row is created on first message).
 // Bodies are read but never returned.
-async function fanMessageStats(fanId) {
+async function fanMessageStats(cid, fanId) {
   let page = 0, total = 0, fanSent = 0, earliest = null;
   for (;;) {
     const j = await tg(`/creator/${cid}/follows/fan/${fanId}/messages?pageIndex=${page}&pageSize=20`);
@@ -122,12 +169,13 @@ async function fanMessageStats(fanId) {
 
 // arrived_at is immutable → cache forever. fanSent (for "replied") is snapshotted
 // alongside it; good enough for funnel analytics (a fan rarely un-replies).
-async function ensureArrival(fanId) {
-  if (arrivals[fanId]) return arrivals[fanId];
-  const s = await fanMessageStats(fanId);
-  arrivals[fanId] = { arrived_at: s.arrived_at, fanSent: s.fanSent };
+async function ensureArrival(cid, fanId) {
+  const k = akey(cid, fanId);
+  if (arrivals[k]) return arrivals[k];
+  const s = await fanMessageStats(cid, fanId);
+  arrivals[k] = { arrived_at: s.arrived_at, fanSent: s.fanSent };
   saveArrivals();
-  return arrivals[fanId];
+  return arrivals[k];
 }
 
 const inWindow = (iso, since) => iso && new Date(iso).getTime() >= since;
@@ -144,19 +192,30 @@ const app = express();
 app.disable("x-powered-by");
 app.get("/health", (_q, r) => r.json({ ok: true }));
 
+// The creators this instance serves. The partner reads this to learn which
+// ?creator= values are valid (and their friendly labels).
+app.get("/funnel/creators", auth, (_q, res) => {
+  res.json({
+    default: defaultCreator,
+    creators: creators.map((c) => ({ id: c.id, label: c.label })),
+  });
+});
+
 // Aggregate funnel. Cheap fields come straight from /follows; arrival-based fields
 // (arrived_in_window, replied, arrivals_by_day) read the warm arrival cache and
 // backfill up to MAX_BACKFILL_PER_CALL uncached fans per call, so accuracy climbs
 // over the first few calls then stays exact.
 app.get("/funnel/summary", auth, async (req, res) => {
+  const cid = pickCreator(req, res);
+  if (!cid) return;
   try {
     const days = Math.max(1, Math.min(365, parseInt(req.query.days) || 30));
     const since = Date.now() - days * 86_400_000;
-    const { fans, totalCount } = await fetchAllFans();
+    const { fans, totalCount } = await fetchAllFans(cid);
 
     let budget = Number(MAX_BACKFILL_PER_CALL);
     for (const f of fans) {
-      if (!arrivals[f.id] && budget > 0) { await ensureArrival(f.id); budget--; }
+      if (!arrivals[akey(cid, f.id)] && budget > 0) { await ensureArrival(cid, f.id); budget--; }
     }
 
     const arrivalsByDay = {};
@@ -164,7 +223,7 @@ app.get("/funnel/summary", auth, async (req, res) => {
     for (const f of fans) {
       if (f.aiEnabled) ai++;
       if (inWindow(f.lastInteractionAt, since)) active++;
-      const a = arrivals[f.id];
+      const a = arrivals[akey(cid, f.id)];
       if (a) {
         if (a.fanSent > 0) replied++;
         if (inWindow(a.arrived_at, since)) {
@@ -176,6 +235,7 @@ app.get("/funnel/summary", auth, async (req, res) => {
     }
 
     res.json({
+      creator: cid,
       window_days: days,
       totals: {
         fans: totalCount,
@@ -187,7 +247,7 @@ app.get("/funnel/summary", auth, async (req, res) => {
       arrivals_by_day: Object.entries(arrivalsByDay)
         .sort(([a], [b]) => a.localeCompare(b))
         .map(([date, count]) => ({ date, count })),
-      arrival_coverage: `${fans.filter((f) => arrivals[f.id]).length}/${fans.length}`,
+      arrival_coverage: `${fans.filter((f) => arrivals[akey(cid, f.id)]).length}/${fans.length}`,
       generated_at: new Date().toISOString(),
     });
   } catch (e) {
@@ -198,10 +258,12 @@ app.get("/funnel/summary", auth, async (req, res) => {
 // Per-fan funnel fields only (no message text, no note, no phone). Message counts
 // + arrival are fetched for the requested page (bounded by ?size).
 app.get("/funnel/fans", auth, async (req, res) => {
+  const cid = pickCreator(req, res);
+  if (!cid) return;
   try {
     const page = Math.max(0, parseInt(req.query.page) || 0);
     const size = Math.max(1, Math.min(200, parseInt(req.query.size) || 50));
-    const { fans, totalCount } = await fetchAllFans();
+    const { fans, totalCount } = await fetchAllFans(cid);
     const slice = fans
       .slice()
       .sort((a, b) => String(b.lastInteractionAt).localeCompare(String(a.lastInteractionAt)))
@@ -209,8 +271,8 @@ app.get("/funnel/fans", auth, async (req, res) => {
 
     const data = [];
     for (const f of slice) {
-      const stats = await fanMessageStats(f.id); // fresh counts for this page
-      if (!arrivals[f.id]) { arrivals[f.id] = { arrived_at: stats.arrived_at, fanSent: stats.fanSent }; saveArrivals(); }
+      const stats = await fanMessageStats(cid, f.id); // fresh counts for this page
+      if (!arrivals[akey(cid, f.id)]) { arrivals[akey(cid, f.id)] = { arrived_at: stats.arrived_at, fanSent: stats.fanSent }; saveArrivals(); }
       data.push({
         fan_id: f.id,
         telegram_fan_id: f.telegramFanId,
@@ -225,7 +287,7 @@ app.get("/funnel/fans", auth, async (req, res) => {
         script_progress: f.scriptProgress ?? null,
       });
     }
-    res.json({ data, total_count: totalCount, page, size });
+    res.json({ creator: cid, data, total_count: totalCount, page, size });
   } catch (e) {
     res.status(502).json({ error: "upstream", detail: String(e.message || e) });
   }
@@ -240,12 +302,15 @@ app.get("/funnel/fans/:fanId/messages", auth, async (req, res) => {
       detail: "Conversation access is off. The OnlyChat owner must set EXPOSE_MESSAGES=true.",
     });
   }
+  const cid = pickCreator(req, res);
+  if (!cid) return;
   try {
     const page = Math.max(0, parseInt(req.query.page) || 0);
     const size = Math.max(1, Math.min(100, parseInt(req.query.size) || 20));
     const j = await tg(`/creator/${cid}/follows/fan/${req.params.fanId}/messages?pageIndex=${page}&pageSize=${size}`);
     const pm = j.paginatedMessages || {};
     res.json({
+      creator: cid,
       fan: j.fan ?? null,
       total_count: pm.totalCount ?? 0,
       page,
@@ -265,4 +330,6 @@ app.get("/funnel/fans/:fanId/messages", auth, async (req, res) => {
   }
 });
 
-app.listen(PORT, () => console.log(`OTC Funnel API listening on :${PORT}`));
+app.listen(PORT, () =>
+  console.log(`OTC Funnel API listening on :${PORT} — serving ${creators.length} creator(s)`)
+);

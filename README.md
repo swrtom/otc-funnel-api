@@ -30,7 +30,8 @@ npm start                 # http://localhost:8787
 |---|---|
 | `PARTNER_API_KEYS` | Key(s) you give partners. `openssl rand -hex 32`. Comma-separate for several. |
 | `ONLYCHAT_ORG_ID` | Your org CUID — from `GET /organization/me` or the SPA URL. |
-| `ONLYCHAT_CREATOR_ID` | Your creator CUID — from the SPA URL. |
+| `ONLYCHAT_CREATOR_IDS` | One **or many** creator CUIDs of the same account, comma-separated. The partner picks one per call with `?creator=<id>`; omitting it uses the first. (Legacy `ONLYCHAT_CREATOR_ID` is still honored for a single creator.) |
+| `ONLYCHAT_CREATORS` | *(optional)* Friendly labels surfaced by `/funnel/creators` — `emy:cuid_aaa,lina:cuid_bbb`. |
 | **Mode A** `ONLYCHAT_TOKEN` | Bearer token sniffed from DevTools on `app.only-chat.ai`. Simplest. ⚠️ Can rotate — re-sniff if you start getting 401s. |
 | **Mode B** `ONLYCHAT_EMAIL` + `ONLYCHAT_PASSWORD` | Recommended. Leave `ONLYCHAT_TOKEN` empty; the service logs in, caches the ~30-min JWT, and auto-refreshes. Survives token rotation. |
 
@@ -38,9 +39,23 @@ npm start                 # http://localhost:8787
 
 All require `Authorization: Bearer <PARTNER_API_KEY>`.
 
-### `GET /funnel/summary?days=30`
+**Multiple creators:** one instance serves every creator listed in `ONLYCHAT_CREATOR_IDS`.
+Add `?creator=<id>` to any `/funnel/*` data endpoint to target one; omit it to hit the first
+configured creator. An unknown id returns `400 unknown_creator` (only configured ids are allowed).
+
+### `GET /funnel/creators`
+Lists the creators this instance serves, so the partner knows which `?creator=` values are valid.
 ```json
 {
+  "default": "cuid_aaa",
+  "creators": [ { "id": "cuid_aaa", "label": "emy" }, { "id": "cuid_bbb", "label": "lina" } ]
+}
+```
+
+### `GET /funnel/summary?days=30&creator=<id>`
+```json
+{
+  "creator": "cuid_aaa",
   "window_days": 30,
   "totals": { "fans": 812, "arrived_in_window": 134, "active_in_window": 410, "replied": 356, "ai_enabled": 790 },
   "arrivals_by_day": [ { "date": "2026-06-01", "count": 7 } ],
@@ -49,9 +64,10 @@ All require `Authorization: Bearer <PARTNER_API_KEY>`.
 }
 ```
 
-### `GET /funnel/fans?days=30&page=0&size=50`
+### `GET /funnel/fans?days=30&page=0&size=50&creator=<id>`
 ```json
 {
+  "creator": "cuid_aaa",
   "data": [
     {
       "fan_id": "cmolsfo9p…", "telegram_fan_id": "6610147988",
@@ -66,7 +82,7 @@ All require `Authorization: Bearer <PARTNER_API_KEY>`.
 }
 ```
 
-### `GET /funnel/fans/:fanId/messages?page=0&size=20` — **opt-in**
+### `GET /funnel/fans/:fanId/messages?page=0&size=20&creator=<id>` — **opt-in**
 Conversation transcript for one fan, newest-first. **Disabled by default** (403) — the OnlyChat
 owner enables it by setting `EXPOSE_MESSAGES=true` in `.env`, since DMs are the most sensitive data.
 ```json
