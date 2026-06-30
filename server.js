@@ -27,6 +27,7 @@ const {
   UPSTREAM_CACHE_TTL_MS = 60000,
   MAX_BACKFILL_PER_CALL = 40,
   EXPOSE_MESSAGES = "false", // opt-in: when "true", /funnel/fans/:id/messages returns message text
+  EXPOSE_REVENUE = "false",  // opt-in: when "true", /funnel/revenue returns per-fan star totals
 } = process.env;
 
 const TG = "https://telegram-api.only-chat.ai";
@@ -180,6 +181,29 @@ async function ensureArrival(cid, fanId) {
 
 const inWindow = (iso, since) => iso && new Date(iso).getTime() >= since;
 
+// Normalize a message/phrase for opener matching: trim + casefold + collapse
+// internal whitespace. Mirrors the partner's match-time normalization. Emojis are
+// preserved (phrases carry them and they boost rarity).
+const norm = (s) => (s || "").replace(/\s+/g, " ").trim().toLowerCase();
+
+// The fan's EARLIEST message (the opener) — text + timestamp. Walks the thread to
+// the end keeping the oldest. Bodies are read here but only the matched phrase
+// (which the partner already supplied) ever leaves this server. Used by /match.
+async function firstMessage(cid, fanId) {
+  let page = 0, earliest = null;
+  for (;;) {
+    const j = await tg(`/creator/${cid}/follows/fan/${fanId}/messages?pageIndex=${page}&pageSize=20`);
+    const data = j.paginatedMessages?.data || [];
+    for (const m of data) {
+      if (!earliest || m.createdAt < earliest.createdAt)
+        earliest = { text: m.text, createdAt: m.createdAt, role: m.role };
+    }
+    if (data.length < 20) break;
+    if (++page > 100) break; // safety: ~2000 messages
+  }
+  return earliest;
+}
+
 // ── partner auth ────────────────────────────────────────────────────────────────
 const auth = (req, res, next) => {
   const k = (req.headers.authorization || "").replace(/^Bearer\s+/i, "");
@@ -288,6 +312,79 @@ app.get("/funnel/fans", auth, async (req, res) => {
       });
     }
     res.json({ creator: cid, data, total_count: totalCount, page, size });
+  } catch (e) {
+    res.status(502).json({ error: "upstream", detail: String(e.message || e) });
+  }
+});
+
+// Opener-phrase attribution WITHOUT exposing messages. The partner posts the
+// active phrase pool (?phrases=, newline/comma-separated); we compare each
+// recently-arrived fan's earliest message against it and return ONLY fan_id ->
+// phrase (+ arrival). Message bodies never leave this box — this is what lets a
+// self-hosted bridge creator attribute clicks to real fans the same way the
+// onlychat_tracking matcher does for native creators. Always on (it leaks no DMs).
+app.get("/funnel/match", auth, async (req, res) => {
+  const cid = pickCreator(req, res);
+  if (!cid) return;
+  try {
+    const days = Math.max(1, Math.min(90, parseInt(req.query.days) || 7));
+    const since = Date.now() - days * 86_400_000;
+    const wanted = new Set(
+      String(req.query.phrases || "").split(/[\n,]/).map(norm).filter(Boolean)
+    );
+    if (!wanted.size) return res.json({ creator: cid, matches: [] });
+
+    const { fans } = await fetchAllFans(cid);
+    const matches = [];
+    let budget = Number(MAX_BACKFILL_PER_CALL);
+    for (const f of fans) {
+      if (!inWindow(f.lastInteractionAt, since)) continue; // skip stale fans
+      const first = await firstMessage(cid, f.id);
+      if (!first || !inWindow(first.createdAt, since)) continue; // arrived outside window
+      const phrase = norm(first.text);
+      if (wanted.has(phrase)) {
+        matches.push({
+          fan_id: f.id,
+          telegram_fan_id: f.telegramFanId,
+          name: f.name,
+          phrase,
+          arrived_at: first.createdAt,
+        });
+      }
+      if (--budget <= 0) break; // bound upstream reads per call
+    }
+    res.json({ creator: cid, matches, generated_at: new Date().toISOString() });
+  } catch (e) {
+    res.status(502).json({ error: "upstream", detail: String(e.message || e) });
+  }
+});
+
+// Per-fan revenue (star totals). Opt-in via EXPOSE_REVENUE=true — it's the only
+// money data the proxy surfaces, so it's off by default to keep the funnel-only
+// posture for partners who don't want to share revenue. When on, a bridge creator
+// can fire the same Meta Purchase CAPI (on star deltas) as a native one. Still no
+// message bodies / notes / phones.
+app.get("/funnel/revenue", auth, async (req, res) => {
+  if (String(EXPOSE_REVENUE).toLowerCase() !== "true") {
+    return res.status(403).json({
+      error: "revenue_disabled",
+      detail: "Revenue is off. The OnlyChat owner must set EXPOSE_REVENUE=true.",
+    });
+  }
+  const cid = pickCreator(req, res);
+  if (!cid) return;
+  try {
+    const { fans, totalCount } = await fetchAllFans(cid);
+    res.json({
+      creator: cid,
+      data: fans.map((f) => ({
+        fan_id: f.id,
+        telegram_fan_id: f.telegramFanId,
+        total_stars: Number(f.totalStars || 0),
+        last_interaction_at: f.lastInteractionAt,
+      })),
+      total_count: totalCount,
+    });
   } catch (e) {
     res.status(502).json({ error: "upstream", detail: String(e.message || e) });
   }

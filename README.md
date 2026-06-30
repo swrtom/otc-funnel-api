@@ -82,6 +82,34 @@ Lists the creators this instance serves, so the partner knows which `?creator=` 
 }
 ```
 
+### `GET /funnel/match?phrases=<list>&days=7&creator=<id>`
+Opener-phrase attribution **without exposing any message text**. The partner posts the phrase
+pool they pre-filled into deep links (`?phrases=`, newline- or comma-separated); the proxy compares
+each recently-arrived fan's *first* message against it **inside this server** and returns only
+`fan_id ↔ phrase`. Lets the partner join a click to a fan without ever reading a DM. Always on
+(it leaks no message bodies).
+```json
+{
+  "creator": "…",
+  "matches": [
+    { "fan_id": "…", "telegram_fan_id": "…", "name": "…", "phrase": "lily 😊", "arrived_at": "2026-04-30T17:59:50Z" }
+  ],
+  "generated_at": "2026-06-30T12:00:00Z"
+}
+```
+
+### `GET /funnel/revenue?creator=<id>` — **opt-in**
+Per-fan star totals (the only money data the proxy surfaces), so the partner can fire revenue
+events on a delta. **Disabled by default** (403) — the OnlyChat owner enables it with
+`EXPOSE_REVENUE=true`. Still no message bodies / notes / phones.
+```json
+{
+  "creator": "…",
+  "data": [ { "fan_id": "…", "telegram_fan_id": "…", "total_stars": 120, "last_interaction_at": "2026-04-30T17:59:50Z" } ],
+  "total_count": 1
+}
+```
+
 ### `GET /funnel/fans/:fanId/messages?page=0&size=20&creator=<id>` — **opt-in**
 Conversation transcript for one fan, newest-first. **Disabled by default** (403) — the OnlyChat
 owner enables it by setting `EXPOSE_MESSAGES=true` in `.env`, since DMs are the most sensitive data.
@@ -97,7 +125,8 @@ owner enables it by setting `EXPOSE_MESSAGES=true` in `.env`, since DMs are the 
 
 ### `GET /health` → `{ "ok": true }` (no auth)
 
-**Off by default** (owner opts in): conversation transcripts (`EXPOSE_MESSAGES=true`).
+**Off by default** (owner opts in): conversation transcripts (`EXPOSE_MESSAGES=true`), per-fan
+star totals (`EXPOSE_REVENUE=true`).
 **Never exposed:** fan notes/personalInfo, phone numbers, your OnlyChat token, org/billing
 endpoints, and any write/mutation. Widening further is a deliberate code change.
 
