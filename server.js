@@ -30,7 +30,9 @@ const {
   EXPOSE_REVENUE = "false",  // opt-in: when "true", /funnel/revenue returns per-fan star totals
 } = process.env;
 
-const TG = "https://telegram-api.only-chat.ai";
+// OnlyChat migrated (June 2026): the old telegram-api.only-chat.ai host is dead.
+// The Telegram funnel data now lives under api.app.only-chat.ai/telegram-bridge.
+const TG = "https://api.app.only-chat.ai/telegram-bridge";
 const API = "https://api.app.only-chat.ai";
 const SECRET = "Banane-Bleue-88"; // required header on the auth host (api.app.*)
 const keys = new Set(PARTNER_API_KEYS.split(",").map((s) => s.trim()).filter(Boolean));
